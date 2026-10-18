@@ -1,0 +1,954 @@
+# Strix Halo Build & Hardening Runbook
+
+Oct 18, 2026 · @Eric
+
+## Scope and decisions
+
+This runbook turns one Ryzen AI Max+ 395 box into a tailnet-only host running Ubuntu 26.04, ZFS, RKE2, Rancher, S3 object storage and local LLMs, hardened to a DISA STIG baseline. Harvester and Houston are out of the design; the table says why. Run the phases in order; each one ends with a check that must pass before the next.
+
+&#91;embedded content: host architecture · one entry, four layers\]
+
+The only way in is `tailscale0`. Inside the host, layers run from cluster workloads down to encrypted storage, and only ZFS replication leaves the box.
+
+| Area | Choice | Why |
+| --- | --- | --- |
+| OS | Ubuntu 26.04 LTS, kernel 7.0 | AMD's ROCm matrix lists Strix Halo (gfx1151) only on Ubuntu and Windows; the kernel already carries the required KFD fixes |
+| Hardening baseline | DISA Canonical Ubuntu 24.04 STIG, applied by hand to 26.04 | No DISA STIG, USG profile or FIPS modules exist for 26.04 yet; gaps go in the exception register |
+| Storage | ZFS 2.4.1 (in-distro) on internal HDDs: one disk now, mirror later | Ubuntu ships prebuilt, Canonical-signed ZFS modules, so Secure Boot stays on |
+| Kubernetes | RKE2 v1.35 with `profile: cis` | Supported by Rancher 2.14 and 2.15; ships CIS hardening and secrets encryption |
+| Management | Rancher 2.15 on the same cluster, via Helm | Manages this cluster and any you add later |
+| Persistent volumes | OpenEBS ZFS-LocalPV | Each PVC is a ZFS dataset with snapshots and quotas |
+| Object storage | Garage on the host as a systemd service | S3 must not depend on the cluster it backs up; MinIO's community repo is archived |
+| Ingress | Tailscale Kubernetes operator; RKE2's bundled ingress disabled | Nothing in the cluster listens on the LAN; services get MagicDNS names with valid TLS |
+| LLM serving | llama.cpp server, Vulkan image first, ROCm image second | Vulkan needs only `/dev/dri`; ROCm adds `/dev/kfd` |
+| Web console | None (no Houston or Cockpit) | Houston has no 26.04 support, and it adds a root-capable web UI on port 9090 |
+
+Assumptions: 128 GB RAM (64 GB values are given where they differ), the OS on an internal NVMe, and the five HDDs on internal SATA.
+
+## Phase 0: Prerequisites and firmware
+
+Set the firmware and collect the values below before installing; later phases reuse them.
+
+**Firmware settings**
+
+- Update to the vendor's latest BIOS.
+- UEFI only, Secure Boot on, firmware admin password set.
+- TPM 2.0 (fTPM) on, for LUKS unlock in Phase 1.
+- iGPU memory (UMA frame buffer) at its minimum, about 512 MB. AMD recommends a small reservation plus a larger shared (TTM/GTT) limit, set in Phase 5.
+- SATA in AHCI mode, not RAID.
+- IOMMU on (DMA protection). Wi-Fi, Bluetooth and wake-on-LAN off if unused. USB and network boot off after install.
+
+**Accounts**
+
+- Tailscale admin access, plus a second admin device already on the tailnet.
+- An Ubuntu Pro free personal token (Livepatch and ESM; covers up to 5 machines).
+- A Tailscale OAuth client for the Kubernetes operator (Phase 7).
+
+**Variables** (set in your shell for every session; examples shown)
+
+```bash
+export HOST=strix01
+export ADMIN=eric
+export TAILNET=example-tailnet.ts.net          # your MagicDNS suffix
+export DISK1=/dev/disk/by-id/ata-EXAMPLE_HDD_SERIAL1
+export POD_CIDR=10.42.0.0/16 SVC_CIDR=10.43.0.0/16   # RKE2 defaults
+```
+
+Check: firmware reports Secure Boot enabled and TPM present, and `ls -l /dev/disk/by-id/ | grep -v part` lists the HDD you will use first.
+
+## Phase 1: Install Ubuntu 26.04 with encrypted, STIG-style mounts
+
+Install Ubuntu Server 26.04.1 on the NVMe with LUKS2 under LVM, one logical volume per STIG-separated path, and leave the HDDs untouched until Phase 4.
+
+1. Download the Server ISO plus `SHA256SUMS` and `SHA256SUMS.gpg`; verify the signature, then the hash.
+2. In the installer pick the minimized server, OpenSSH server on, no featured snaps.
+3. Choose a custom storage layout on the NVMe (sizes assume 2 TB; scale to yours):
+
+| Mount | Size | Mount options | Reason |
+| --- | --- | --- | --- |
+| `/boot/efi` | 1 GB | defaults | Unencrypted ESP |
+| `/boot` | 2 GB | `nodev,nosuid` | Unencrypted kernels and initramfs |
+| LUKS2 volume, LVM group `vg0` | rest of disk |  | Everything below lives inside it |
+| `/` | 60 GB | defaults |  |
+| `/home` | 10 GB | `nodev,nosuid` | STIG separate mount |
+| `/tmp` | 10 GB | `nodev,nosuid,noexec` | STIG separate mount |
+| `/var` | 40 GB | `nodev` | STIG separate mount |
+| `/var/tmp` | 10 GB | `nodev,nosuid,noexec` | STIG separate mount |
+| `/var/log` | 20 GB | `nodev,nosuid,noexec` | STIG separate mount |
+| `/var/log/audit` | 20 GB | `nodev,nosuid,noexec` | Audit records can't fill `/var/log` |
+| `/var/lib/rancher` | 200 GB | `nodev` | Container images and etcd; must stay executable |
+| `/srv/models` | 600 GB, XFS | `nodev,nosuid,noexec` | LLM weights on NVMe, not HDD |
+| `/srv/fast` | 50 GB | `nodev,nosuid,noexec` | Garage metadata (random I/O) |
+| unallocated | remainder |  | Grow volumes later with `lvextend` |
+
+No swap: the kubelet expects it off.
+
+4. After first boot, bind LUKS to the TPM so patch reboots don't wait at a console. Ubuntu 26.04 builds its initramfs with dracut, so rebuild with dracut after editing crypttab ([26.04 changes](https://computingforgeeks.com/?p=166549)).
+
+```bash
+LUKS_DEV=/dev/nvme0n1p3                       # the LUKS partition from lsblk
+sudo systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 "$LUKS_DEV"
+# In /etc/crypttab, add tpm2-device=auto to that volume's options, then:
+sudo dracut -f --regenerate-all
+```
+
+Keep the passphrase slot as break-glass and store the recovery passphrase offline. A Secure Boot database update changes PCR 7, so expect one passphrase prompt at the console after such updates; re-run the enrolment afterward.
+
+5. Patch and attach Ubuntu Pro (Livepatch covers 26.04; it ships as a snap, so keep `snapd`):
+
+```bash
+sudo apt update && sudo apt full-upgrade -y
+sudo pro attach <your-token>
+sudo pro enable livepatch
+sudo pro status
+```
+
+Check: `uname -r` reports a 7.0 kernel, `mokutil --sb-state` says SecureBoot enabled, `findmnt -no OPTIONS /tmp` includes `noexec`, and `sudo systemd-cryptenroll "$LUKS_DEV"` lists both `password` and `tpm2`.
+
+## Phase 2: Harden the OS to the STIG baseline
+
+Apply the [DISA Canonical Ubuntu 24.04 LTS STIG](https://ncp.nist.gov/checklist/revision/6362) (V1R4 is the newest release found) by hand. DISA has no 26.04 STIG, and Canonical's USG automation covers only 22.04 and 24.04 ([Pro feature matrix](https://ubuntu.com/aws/pro?format=md)). Treat the STIG checklist as the source of truth, mark each rule Pass, N/A or Exception, and record exceptions in the register near the end of this doc.
+
+### 2.1 Baseline before changes
+
+```bash
+sudo apt install -y lynis openscap-scanner
+sudo lynis audit system --quick | tee ~/lynis-before.txt
+```
+
+Load the STIG zip from public.cyber.mil into DISA STIG Viewer on your workstation and create a checklist for this host.
+
+### 2.2 Reduce the attack surface
+
+```bash
+sudo apt purge -y telnet ftp tftp rsh-client nis avahi-daemon 'cups*' 2>/dev/null
+# Crash dumps are on by default in 26.04; dumps can hold keys, and the reservation costs RAM
+sudo apt purge -y kdump-tools linux-crashdump && sudo update-grub
+```
+
+`/etc/modprobe.d/60-stig.conf` (internal SATA drives are unaffected by the usb-storage block):
+
+```
+install usb-storage /bin/false
+blacklist usb-storage
+install dccp /bin/false
+install rds /bin/false
+install tipc /bin/false
+install cramfs /bin/false
+install freevxfs /bin/false
+install hfs /bin/false
+install hfsplus /bin/false
+install jffs2 /bin/false
+install udf /bin/false
+```
+
+### 2.3 Accounts, passwords, sudo
+
+```bash
+sudo passwd -l root
+sudo groupadd sshadmins && sudo usermod -aG sshadmins "$ADMIN"
+```
+
+- `/etc/security/pwquality.conf`: `minlen = 15`, `ucredit = -1`, `lcredit = -1`, `dcredit = -1`, `ocredit = -1`, `difok = 8`, `dictcheck = 1`, `enforcing = 1`.
+- `/etc/login.defs`: `PASS_MIN_DAYS 1`, `PASS_MAX_DAYS 60`, `ENCRYPT_METHOD SHA512`, `UMASK 077`, then `sudo chage -m 1 -M 60 "$ADMIN"`.
+- `/etc/security/faillock.conf`: `deny = 3`, `fail_interval = 900`, `unlock_time = 0`. Add the `pam_faillock` lines to `/etc/pam.d/common-auth` and `common-account` exactly as the STIG fix text gives them, and remove `nullok` from `common-auth`. Test `sudo -v` in a second session before closing the first.
+- `/etc/profile.d/99-tmout.sh`: `readonly TMOUT=600; export TMOUT`.
+- `/etc/security/limits.d/60-stig.conf`: `* hard maxlogins 10`.
+- Banner text in `/etc/issue` and `/etc/issue.net`.
+- sudo: 26.04 ships `sudo-rs` as the default `sudo`, which supports a subset of sudoers options ([26.04 changes](https://computingforgeeks.com/?p=165185)). Check each sudo-related STIG rule against it (no `NOPASSWD`, no `!authenticate`). If a required directive isn't supported, switch to classic sudo, which stays installed: `sudo update-alternatives --config sudo`.
+
+### 2.4 SSH
+
+`/etc/ssh/sshd_config.d/10-stig.conf`, then `sudo sshd -t && sudo systemctl reload ssh`:
+
+```
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PubkeyAuthentication yes
+UsePAM yes
+AllowGroups sshadmins
+X11Forwarding no
+AllowTcpForwarding no
+MaxAuthTries 3
+ClientAliveInterval 600
+ClientAliveCountMax 1
+LogLevel VERBOSE
+Banner /etc/issue.net
+Ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
+KexAlgorithms mlkem768x25519-sha256,ecdh-sha2-nistp384,ecdh-sha2-nistp256,diffie-hellman-group-exchange-sha256
+```
+
+The first KEX entry is OpenSSH 10.2's post-quantum hybrid; keeping it is a logged deviation (E-05). Port exposure is limited to the tailnet in Phase 3.
+
+### 2.5 Kernel parameters and boot
+
+`/etc/sysctl.d/60-stig.conf`, then `sudo sysctl --system`:
+
+```
+kernel.randomize_va_space = 2
+kernel.dmesg_restrict = 1
+kernel.kptr_restrict = 2
+kernel.yama.ptrace_scope = 1
+kernel.unprivileged_bpf_disabled = 1
+net.core.bpf_jit_harden = 2
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.suid_dumpable = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.tcp_syncookies = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+```
+
+Do not set `net.ipv4.ip_forward = 0`; Kubernetes needs forwarding (E-03).
+
+- Kernel command line: create `/etc/default/grub.d/90-stig.cfg` with `GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX audit=1 audit_backlog_limit=8192"`, then `sudo update-grub`.
+- GRUB superuser: hash a password with `grub-mkpasswd-pbkdf2`, add `set superusers="root"` and the `password_pbkdf2` line to `/etc/grub.d/40_custom`, and add `--unrestricted` to the default entries so unattended boots still work. Re-check after GRUB package updates.
+
+### 2.6 AppArmor, audit, file integrity, time
+
+```bash
+sudo apt install -y apparmor-utils auditd audispd-plugins aide aide-common
+sudo aa-status            # every loaded profile in enforce mode
+```
+
+`/etc/audit/auditd.conf`: `space_left = 25%`, `space_left_action = email`, `action_mail_acct = root`, `admin_space_left_action = single`, `max_log_file_action = keep_logs`, `disk_full_action = SYSLOG` (E-09). Rules in `/etc/audit/rules.d/50-stig.rules`; the STIG lists every required rule, and this is the core set plus the cluster paths:
+
+```
+-w /etc/passwd -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/security/opasswd -p wa -k identity
+-w /etc/sudoers -p wa -k privileged
+-w /etc/sudoers.d/ -p wa -k privileged
+-w /var/run/faillock -p wa -k logins
+-w /var/log/wtmp -p wa -k logins
+-w /var/log/btmp -p wa -k logins
+-a always,exit -F arch=b64 -S execve -C uid!=euid -F euid=0 -k execpriv
+-a always,exit -F arch=b64 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=unset -k perm_mod
+-a always,exit -F arch=b64 -S chown,fchown,fchownat,lchown -F auid>=1000 -F auid!=unset -k perm_mod
+-a always,exit -F arch=b64 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=unset -k perm_mod
+-a always,exit -F arch=b64 -S unlink,unlinkat,rename,renameat -F auid>=1000 -F auid!=unset -k delete
+-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -F auid>=1000 -F auid!=unset -k module_chng
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd
+-w /etc/rancher/ -p wa -k rke2-config
+-w /var/lib/rancher/rke2/server/cred/ -p wa -k rke2-creds
+-w /etc/zfs/keys/ -p rwa -k zfs-keys
+-e 2
+```
+
+For the privileged-command rules, point `-F path=` at the real binaries (`readlink -f /usr/bin/sudo` resolves the sudo-rs path). `-e 2` locks the rules until reboot. Load with `sudo augenrules --load`.
+
+AIDE: create `/etc/aide/aide.conf.d/90-local-exclusions` with `!/var/lib/rancher`, `!/var/lib/kubelet`, `!/var/log/pods`, `!/var/log/containers`, `!/srv/models`, `!/srv/fast` and `!/tank` (E-07), then `sudo aideinit -y -f`.
+
+Time: 26.04 installs chrony with NTS-authenticated Ubuntu time servers by default ([release summary](https://versionlog.com/ubuntu/26.04/)). Confirm with `chronyc -N authdata`.
+
+Check: `sudo auditctl -s` shows `enabled 2`, `sudo sshd -T | grep -i ciphers` matches the list above, `aa-status` shows nothing in complain mode, and a new `lynis audit system` scores higher than `~/lynis-before.txt`. Update the STIG Viewer checklist.
+
+## Phase 3: Tailnet-only access
+
+Tailscale is the only remote path in. UFW drops all other inbound traffic, and cluster services publish through the Tailscale operator in Phase 7, so nothing is reachable from the LAN.
+
+**Tailnet policy** (admin console → Access controls). Tailscale manages its own netfilter rules for `tailscale0`, so these grants are the port filter that binds for tailnet traffic:
+
+```json
+{
+  "tagOwners": {
+    "tag:strix":        ["autogroup:admin"],
+    "tag:k8s-operator": ["autogroup:admin"],
+    "tag:k8s":          ["tag:k8s-operator"]
+  },
+  "grants": [
+    {"src": ["autogroup:admin"], "dst": ["tag:strix"], "ip": ["tcp:22", "tcp:6443"]},
+    {"src": ["autogroup:admin"], "dst": ["tag:k8s"],   "ip": ["tcp:443"]}
+  ]
+}
+```
+
+**Install Tailscale from its signed repository** (use the `noble` files if `resolute` isn't listed yet):
+
+```bash
+curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/resolute.noarmor.gpg \
+  | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/resolute.tailscale-keyring.list \
+  | sudo tee /etc/apt/sources.list.d/tailscale.list
+sudo apt update && sudo apt install -y tailscale
+sudo tailscale up --advertise-tags=tag:strix --ssh=false
+export TS_IP=$(tailscale ip -4)
+```
+
+OpenSSH stays the login path (`--ssh=false`) so logins land in auditd and the STIG SSH settings apply.
+
+**Host firewall** (UFW is preinstalled but inactive on 26.04):
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow in on tailscale0 to any port 22 proto tcp
+sudo ufw allow in on tailscale0 to any port 6443 proto tcp
+sudo ufw allow from "$POD_CIDR"     # pods reaching the API server, kubelet, Garage
+sudo ufw allow from "$SVC_CIDR"
+sudo ufw allow 41641/udp           # Tailscale direct connections (optional)
+sudo ufw logging medium
+sudo ufw enable
+```
+
+UFW filters traffic addressed to the host; it does not see pod traffic the CNI forwards. That is why this build never publishes a NodePort or hostPort (Phase 6 pins NodePorts to loopback) and uses the Tailscale operator instead. Break-glass access is the physical console, not a LAN SSH rule.
+
+Check: from a LAN device without Tailscale, `nc -zv <lan-ip> 22` and `nc -zv <lan-ip> 6443` both fail; from a tailnet admin device, `ssh $ADMIN@$HOST` works; `sudo ufw status verbose` matches the rules above.
+
+## Phase 4: ZFS pool on the HDDs
+
+Create pool `tank` on the first HDD, encrypt everything under `tank/enc`, and grow it by attaching a mirror partner and then adding mirror pairs. Ubuntu 26.04 ships ZFS 2.4.1 prebuilt for its kernel ([package](https://packages.ubuntu.com/eu/resolute/arm64/zfsutils-linux)), so there is no DKMS step.
+
+```bash
+sudo apt install -y zfsutils-linux sanoid smartmontools
+sudo zpool create -o ashift=12 \
+  -O compression=lz4 -O atime=off -O xattr=sa -O acltype=posixacl \
+  -O mountpoint=/tank -O canmount=off tank "$DISK1"
+
+# Raw key on the LUKS-protected root: the pool unlocks only after the OS volume does
+sudo install -d -m 0700 /etc/zfs/keys
+sudo dd if=/dev/urandom of=/etc/zfs/keys/tank-enc.key bs=32 count=1
+sudo chmod 0400 /etc/zfs/keys/tank-enc.key
+sudo zfs create -o encryption=aes-256-gcm -o keyformat=raw \
+  -o keylocation=file:///etc/zfs/keys/tank-enc.key -o canmount=off tank/enc
+
+sudo zfs create -o mountpoint=none tank/enc/k8s                         # OpenEBS PVC datasets
+sudo zfs create -o mountpoint=/tank/s3 -o recordsize=1M tank/enc/s3      # Garage data
+sudo zfs create -o mountpoint=/tank/backup -o recordsize=1M tank/enc/backup
+sudo zfs set copies=2 tank/enc/backup     # single-disk period only (E-08)
+```
+
+Copy the key file to offline storage now; losing it loses the pool. `copies=2` guards against bad sectors, not a dead disk, and applies only to data written after it is set.
+
+Load keys at boot with `/etc/systemd/system/zfs-load-key.service`, then `sudo systemctl enable zfs-load-key`:
+
+```ini
+[Unit]
+Description=Load ZFS encryption keys
+DefaultDependencies=no
+After=zfs-import.target
+Before=zfs-mount.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/zfs load-key -a
+
+[Install]
+WantedBy=zfs-mount.service
+```
+
+**Health and snapshots**
+
+- Scrubs: confirm the monthly scrub job from `zfsutils-linux` is present (`systemctl list-timers` or `/etc/cron.d/zfsutils-linux`).
+- ZED alerts: set `ZED_EMAIL_ADDR` and `ZED_NOTIFY_VERBOSE=1` in `/etc/zfs/zed.d/zed.rc`, with a mail relay such as `msmtp`.
+- SMART: enable `smartd` with a short self-test daily and a long one weekly.
+- Snapshots: `/etc/sanoid/sanoid.conf`
+
+```ini
+[tank/enc]
+  use_template = production
+  recursive = yes
+
+[template_production]
+  hourly = 24
+  daily = 30
+  monthly = 6
+  autosnap = yes
+  autoprune = yes
+```
+
+**Growth path (mirror route)**
+
+| Drives | Command | Result |
+| --- | --- | --- |
+| 2 | `sudo zpool attach tank "$DISK1" "$DISK2"` | Two-way mirror; then `sudo zfs set copies=1 tank/enc/backup` |
+| 4 | `sudo zpool add tank mirror "$DISK3" "$DISK4"` | Two mirror vdevs, 50% of raw capacity usable |
+| 5 | `sudo zpool add tank spare "$DISK5"` | Hot spare; 40% of raw capacity usable |
+
+Decision point before drive 2: a mirror can never become RAIDZ. To end at RAIDZ2 instead (60% usable, any two drives can fail), skip the attach. Once you hold drives 2–4, build a new RAIDZ2 pool from those three and copy over with `zfs send -Rw` (raw, so encryption carries over). Destroy `tank`, then widen the new vdev with the old disk: `zpool attach <newpool> raidz2-0 "$DISK1"`. RAIDZ expansion keeps the parity level and can repeat ([OpenZFS](https://github.com/openzfs/zfs/pull/12225)). Blocks written before an expansion keep the old data-to-parity ratio until rewritten with `zfs rewrite` ([2.3.4 notes](https://en.linuxadictos.com/OpenZFS-2--3--and-4-arrive-with-expanded-compatibility-and-ZFS-Rewrite-in-detail..html)).
+
+Check: `zpool status tank` is ONLINE with no errors, and after a reboot `zfs get keystatus tank/enc` says `available`. `sudo smartctl -H "$DISK1"` says PASSED.
+
+## Phase 5: GPU and unified-memory budget
+
+Let the iGPU map up to 96 GB of shared memory, cap the ZFS ARC at 12 GB, and leave about 20 GB for the host and cluster. The shared limit is a ceiling, not a reservation: GTT memory returns to the system when the GPU frees it ([AMD RDNA3.5 guide](https://rocm.docs.amd.com/en/docs-7.14.0/_sources/reference/system-optimization/rdna3-5.rst)).
+
+| Consumer | 128 GB box | 64 GB box | Where it is set |
+| --- | --- | --- | --- |
+| Firmware UMA reservation | 0.5 GB | 0.5 GB | BIOS (Phase 0) |
+| GPU shared limit (TTM/GTT) | 96 GB | 40 GB | `ttm pages_limit` |
+| ZFS ARC maximum | 12 GB | 6 GB | `zfs_arc_max` |
+| Host, RKE2, Rancher, Garage | about 19.5 GB | about 17.5 GB | kubelet reservations (Phase 6) |
+
+AMD requires specific KFD fixes for this chip; Ubuntu 26.04's generic kernel is in AMD's supported column, so no kernel change is needed.
+
+```bash
+# GPU shared limit: 96 GiB = 25165824 pages of 4 KiB (64 GB box: 10485760)
+echo 'options ttm pages_limit=25165824' | sudo tee /etc/modprobe.d/ttm.conf
+
+# ARC cap: 12 GiB (64 GB box: 6442450944)
+echo 'options zfs zfs_arc_max=12884901888' | sudo tee /etc/modprobe.d/zfs.conf
+echo 12884901888 | sudo tee /sys/module/zfs/parameters/zfs_arc_max
+
+# amdgpu and ttm can load from the initramfs, which 26.04 builds with dracut
+sudo dracut -f --regenerate-all
+sudo reboot
+```
+
+AMD's `amd-ttm` helper (`pipx install amd-debug-tools`) reads and sets the same limit if you prefer it. Keep `linux-firmware` current: one release (20251125) was reported to break ROCm on Strix Halo ([Strix Halo toolboxes](https://github.com/kyuz0/amd-strix-halo-toolboxes)).
+
+Check: `cat /sys/module/ttm/parameters/pages_limit` prints 25165824, `arc_summary | grep -i 'max size'` shows 12 GiB, and `/dev/dri/renderD128` and `/dev/kfd` both exist.
+
+## Phase 6: RKE2 with the CIS profile
+
+Install RKE2 from the v1.35 channel with `profile: cis`, disable its bundled ingress, pin NodePorts to loopback, and log API activity with a real audit policy. Kubernetes 1.35 is supported by both Rancher 2.14 and 2.15 ([2.14.6 notes](https://documentation.suse.com/cloudnative/rancher-manager/v2.14/en/release-notes/v2.14.6.html)). For STIG coverage of this layer, use DISA's Rancher Government Solutions RKE2 STIG.
+
+**Prerequisites from the [RKE2 hardening guide](https://docs.rke2.io/security/hardening_guide)**
+
+```bash
+sudo useradd -r -c "etcd user" -s /sbin/nologin -M etcd -U
+curl -sfL https://get.rke2.io -o ~/rke2-install.sh     # read it before running
+sudo INSTALL_RKE2_CHANNEL=v1.35 sh ~/rke2-install.sh
+sudo cp -f /usr/local/share/rke2/rke2-cis-sysctl.conf /etc/sysctl.d/60-rke2-cis.conf
+sudo systemctl restart systemd-sysctl
+```
+
+On Ubuntu the installer uses the tarball method, hence the `/usr/local/share/rke2` path.
+
+**`/etc/rancher/rke2/config.yaml`** (mode 0600; substitute your values):
+
+```yaml
+profile: cis
+write-kubeconfig-mode: "0600"
+node-name: strix01
+tls-san:
+  - strix01.example-tailnet.ts.net
+  - 100.64.0.10                      # $TS_IP
+disable:
+  - rke2-ingress-nginx               # services publish via the Tailscale operator
+secrets-encryption: true             # already the default; explicit for the STIG check
+audit-policy-file: /etc/rancher/rke2/audit-policy.yaml
+kube-apiserver-arg:
+  - audit-log-maxage=30
+  - audit-log-maxbackup=10
+  - audit-log-maxsize=100
+kube-proxy-arg:
+  - nodeport-addresses=127.0.0.0/8   # a NodePort can never open on the LAN
+kubelet-arg:
+  - system-reserved=cpu=1,memory=4Gi
+  - kube-reserved=cpu=1,memory=4Gi
+  - eviction-hard=memory.available<2Gi,nodefs.available<10%
+etcd-snapshot-schedule-cron: "0 */6 * * *"
+etcd-snapshot-retention: 28
+```
+
+**`/etc/rancher/rke2/audit-policy.yaml`**: metadata for secrets (never bodies), full detail for RBAC changes and exec:
+
+```yaml
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: ["RequestReceived"]
+rules:
+  - level: None
+    nonResourceURLs: ["/healthz*", "/readyz*", "/livez*", "/version"]
+  - level: None
+    users: ["system:kube-proxy"]
+    verbs: ["watch"]
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets", "configmaps", "serviceaccounts/token"]
+  - level: RequestResponse
+    verbs: ["create", "update", "patch", "delete"]
+    resources:
+      - group: "rbac.authorization.k8s.io"
+      - group: ""
+        resources: ["pods/exec", "pods/attach", "pods/portforward"]
+  - level: Metadata
+```
+
+**Start and connect**
+
+```bash
+sudo systemctl enable --now rke2-server
+mkdir -p ~/.kube && sudo install -m 0600 -o "$ADMIN" /etc/rancher/rke2/rke2.yaml ~/.kube/config
+export PATH=$PATH:/var/lib/rancher/rke2/bin
+kubectl get nodes
+sudo rke2 secrets-encrypt status
+```
+
+Install Helm 3.18 or newer (Rancher requires it) from the release tarball, verifying the published SHA-256.
+
+The CIS profile sets cluster-wide Pod Security Admission to `restricted`, with system namespaces exempt. A namespace that needs more (OpenEBS's node plugin, for example) gets an explicit label in Phase 7, never a blanket exemption.
+
+Check: the node is Ready. `rke2 secrets-encrypt status` reports Enabled. `kubectl run psa-test --image=busybox --privileged -n default` is rejected. `/var/lib/rancher/rke2/server/logs/audit.log` grows. `sudo ss -tlnp` shows no NodePort range (30000–32767) bound outside 127.0.0.1.
+
+## Phase 7: Storage, S3, ingress, Rancher, backups
+
+Garage runs on the host so S3 survives a broken cluster. OpenEBS turns `tank/enc/k8s` into PVCs. The Tailscale operator is the only ingress, and Rancher sits behind it. etcd snapshots, which hold Rancher's state too, land in Garage and then go offsite.
+
+### 7.1 Garage S3 on the host
+
+MinIO's community repository was archived in February 2026 ([background](https://blog.vonng.com/en/db/minio-resurrect/index.md)); Garage is a single binary with a one-node mode (`replication_factor = 1`, [quick start](https://garagehq.deuxfleurs.fr/documentation/quick-start)). Download the current static `x86_64` release, verify its SHA-256, and install it as `/usr/local/bin/garage`.
+
+```bash
+sudo useradd -r -s /usr/sbin/nologin -d /var/lib/garage garage
+sudo install -d -o garage -g garage -m 0700 /srv/fast/garage-meta /tank/s3/data /etc/garage
+for f in rpc_secret admin_token metrics_token; do
+  openssl rand -hex 32 | sudo tee /etc/garage/$f >/dev/null
+done
+sudo chown garage:garage /etc/garage/* && sudo chmod 0600 /etc/garage/*
+```
+
+`/etc/garage.toml`:
+
+```toml
+metadata_dir = "/srv/fast/garage-meta"   # NVMe: metadata is random I/O
+data_dir = "/tank/s3/data"
+db_engine = "lmdb"
+replication_factor = 1
+rpc_bind_addr = "127.0.0.1:3901"
+rpc_public_addr = "127.0.0.1:3901"
+rpc_secret_file = "/etc/garage/rpc_secret"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "0.0.0.0:3900"          # UFW admits only pods and localhost
+root_domain = ".s3.garage.internal"
+
+[admin]
+api_bind_addr = "127.0.0.1:3903"
+admin_token_file = "/etc/garage/admin_token"
+metrics_token_file = "/etc/garage/metrics_token"
+```
+
+`/etc/systemd/system/garage.service`:
+
+```ini
+[Unit]
+Description=Garage S3 object storage
+After=network-online.target zfs-mount.service
+Wants=network-online.target
+RequiresMountsFor=/tank/s3 /srv/fast
+
+[Service]
+User=garage
+Group=garage
+ExecStart=/usr/local/bin/garage -c /etc/garage.toml server
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/tank/s3/data /srv/fast/garage-meta
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable --now garage
+alias g='sudo -u garage garage -c /etc/garage.toml'
+g status                                   # copy the node ID
+g layout assign -z dc1 -c 2T <node-id>
+g layout apply --version 1
+g bucket create etcd-snapshots
+g key create rke2-etcd                     # note the key ID and secret
+g bucket allow --read --write etcd-snapshots --key rke2-etcd
+```
+
+### 7.2 OpenEBS ZFS-LocalPV
+
+```bash
+helm repo add openebs https://openebs.github.io/openebs && helm repo update
+kubectl create namespace openebs
+kubectl label ns openebs pod-security.kubernetes.io/enforce=privileged   # node plugin mounts host paths
+helm install openebs openebs/openebs -n openebs \
+  --set engines.replicated.mayastor.enabled=false \
+  --set engines.local.lvm.enabled=false \
+  --set loki.enabled=false --set alloy.enabled=false
+```
+
+StorageClass (`poolname` may name a child dataset, [OpenEBS](https://www.github.com/openebs/zfs-localpv)):
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: zfs-tank
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: zfs.csi.openebs.io
+parameters:
+  poolname: "tank/enc/k8s"     # children inherit encryption
+  fstype: "zfs"
+  compression: "lz4"
+  recordsize: "128k"
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+```
+
+If `openebs-hostpath` is also marked default, unmark it so PVCs land on ZFS.
+
+### 7.3 Tailscale Kubernetes operator (the only ingress)
+
+In the Tailscale admin console, turn on MagicDNS and HTTPS certificates, then create an OAuth client with the Devices Core and Auth Keys write scopes, tagged `tag:k8s-operator` ([operator docs](https://Tailscale.com/kb/1236/kubernetes-operator)).
+
+```bash
+read -rs TS_CLIENT_ID; read -rs TS_CLIENT_SECRET   # keeps secrets out of shell history
+helm repo add tailscale https://pkgs.tailscale.com/helmcharts && helm repo update
+kubectl create namespace tailscale
+kubectl label ns tailscale pod-security.kubernetes.io/enforce=privileged   # proxies need NET_ADMIN
+helm upgrade --install tailscale-operator tailscale/tailscale-operator -n tailscale \
+  --set-string oauth.clientId="$TS_CLIENT_ID" \
+  --set-string oauth.clientSecret="$TS_CLIENT_SECRET" --wait
+```
+
+### 7.4 Rancher
+
+The Tailscale proxy terminates TLS with a publicly trusted certificate and forwards plain HTTP, which is Rancher's `tls=external` mode; so no cert-manager and no Rancher ingress ([chart options](https://documentation.suse.com/cloudnative/rancher-manager/v2.15/en/installation-and-upgrade/references/helm-chart-options.html)).
+
+```bash
+helm repo add rancher-stable https://releases.rancher.com/server-charts/stable && helm repo update
+kubectl create namespace cattle-system
+helm install rancher rancher-stable/rancher -n cattle-system \
+  --set hostname=rancher.$TAILNET \
+  --set replicas=1 \
+  --set tls=external \
+  --set ingress.enabled=false \
+  --set auditLog.enabled=true --set auditLog.level=1
+```
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rancher-tailnet
+  namespace: cattle-system
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service:
+      name: rancher
+      port:
+        number: 80
+  tls:
+    - hosts:
+        - rancher        # becomes https://rancher.<tailnet>.ts.net
+```
+
+Read the generated bootstrap password rather than putting one on the command line: `kubectl -n cattle-system get secret bootstrap-secret -o go-template='{{.data.bootstrapPassword|base64decode}}'`. Change it at first login and turn on the session idle timeout (`auth-user-session-idle-ttl-minutes`).
+
+On a hardened cluster some Rancher cluster tools won't install ([known issue](https://documentation.suse.com/cloudnative/rancher-manager/v2.14/en/release-notes/v2.14.6.html)). If Rancher pods are rejected, `kubectl get events -A | grep -i podsecurity` names the namespace; label only that namespace, and log each label in the exception register.
+
+### 7.5 Backups
+
+Add to `/etc/rancher/rke2/config.yaml`, then `sudo systemctl restart rke2-server`:
+
+```yaml
+etcd-s3: true
+etcd-s3-endpoint: 127.0.0.1:3900
+etcd-s3-bucket: etcd-snapshots
+etcd-s3-region: garage
+etcd-s3-access-key: <key id>
+etcd-s3-secret-key: <secret>
+etcd-s3-insecure: true        # plain HTTP on loopback only (E-10)
+```
+
+Snapshots now live on the NVMe and on `tank` (Garage). For the off-box copy, replicate nightly over the tailnet with raw sends so the key never leaves this host: `syncoid --sendoptions=w --recursive tank/enc <user>@<offsite-host>:<pool>/strix`.
+
+Check: a test PVC binds and `zfs list -r tank/enc/k8s` shows its dataset. `https://rancher.<tailnet>.ts.net` opens from a tailnet device and not from the LAN. `sudo rke2 etcd-snapshot list` shows S3 entries, and `g bucket info etcd-snapshots` shows objects.
+
+## Phase 8: LLM serving
+
+Run llama.cpp's server in its own `restricted` namespace with no egress, an API key and a tailnet-only endpoint. The GPU comes from AMD's device plugin and the weights are mounted read-only from NVMe. Start with the Vulkan image, which needs only `/dev/dri`. The ROCm image (`server-rocm`) is the alternative once Vulkan works ([image list](https://huggingface.co/tda45/TdAI/raw/main/llama.cpp/docs/docker.md)).
+
+### 8.1 GPU device plugin
+
+The plugin exposes the iGPU as the `amd.com/gpu` resource ([AMD docs](https://instinct.docs.amd.com/projects/k8s-device-plugin/en/latest/index.html)). Download the DaemonSet manifest from a release tag rather than `master`, pin its image by digest, and apply it to `kube-system`:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/ROCm/k8s-device-plugin/<release-tag>/k8s-ds-amdgpu-dp.yaml
+# edit image: to image@sha256:<digest>, then
+kubectl apply -f k8s-ds-amdgpu-dp.yaml
+kubectl get node "$HOST" -o jsonpath='{.status.allocatable.amd\.com/gpu}'   # prints 1
+```
+
+### 8.2 Model hygiene
+
+- Use GGUF or safetensors only. Pickle formats (`.bin`, `.pt`, `.pth`) can execute code when loaded.
+- Pin each download to a Hugging Face commit, verify its SHA-256, and record it in `/srv/models/MANIFEST.sha256`.
+- Files `root:root 0444`, directories `0555`; the pod mounts them read-only.
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: { name: local-models }
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata: { name: models-nvme }
+spec:
+  capacity: { storage: 600Gi }
+  accessModes: [ReadOnlyMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-models
+  local: { path: /srv/models }
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - { key: kubernetes.io/hostname, operator: In, values: [strix01] }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: models, namespace: llm }
+spec:
+  storageClassName: local-models
+  accessModes: [ReadOnlyMany]
+  resources: { requests: { storage: 600Gi } }
+```
+
+### 8.3 Namespace, key and network isolation
+
+```bash
+kubectl create namespace llm
+kubectl label ns llm pod-security.kubernetes.io/enforce=restricted
+openssl rand -hex 32 | kubectl -n llm create secret generic llama-api-key --from-file=api-key=/dev/stdin
+getent group video render     # GIDs for supplementalGroups below
+```
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny, namespace: llm }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]      # no egress at all: the server needs none
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: from-tailscale-proxy, namespace: llm }
+spec:
+  podSelector: { matchLabels: { app: llama } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: tailscale }
+      ports:
+        - { port: 8080, protocol: TCP }
+```
+
+### 8.4 Server, service, tailnet endpoint
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: llama, namespace: llm }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: llama } }
+  template:
+    metadata: { labels: { app: llama } }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        supplementalGroups: [44, 992]          # video, render: use your getent values
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: server
+          image: ghcr.io/ggml-org/llama.cpp:server-vulkan@sha256:<digest>
+          args:
+            - --model=/models/<model>.gguf
+            - --host=0.0.0.0
+            - --port=8080
+            - --n-gpu-layers=999
+            - --ctx-size=32768
+            - --api-key-file=/secrets/api-key
+            - --metrics
+          env:
+            - { name: HOME, value: /tmp }
+            - { name: MESA_SHADER_CACHE_DIR, value: /tmp/mesa-cache }
+          ports: [{ containerPort: 8080 }]
+          resources:
+            limits: { amd.com/gpu: 1, memory: 8Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: models, mountPath: /models, readOnly: true }
+            - { name: apikey, mountPath: /secrets, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: models
+          persistentVolumeClaim: { claimName: models, readOnly: true }
+        - name: apikey
+          secret: { secretName: llama-api-key }
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata: { name: llama, namespace: llm }
+spec:
+  selector: { app: llama }
+  ports: [{ port: 8080, targetPort: 8080 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: llama, namespace: llm }
+spec:
+  ingressClassName: tailscale
+  defaultBackend: { service: { name: llama, port: { number: 8080 } } }
+  tls: [{ hosts: [llm] }]              # https://llm.<tailnet>.ts.net
+```
+
+Get the digest with `skopeo inspect docker://ghcr.io/ggml-org/llama.cpp:server-vulkan`. The 8 GiB memory limit caps CPU-side memory; GPU allocations through GTT generally aren't charged to it. Raise the limit if the pod is OOM-killed while loading a model.
+
+Check: the pod log names the Radeon 8060S and shows layers offloaded to it. From a tailnet device, `curl -H "Authorization: Bearer <key>" https://llm.<tailnet>.ts.net/v1/models` returns 200, and the same call without the header returns 401. A test pod in another namespace can't reach `llama.llm:8080`.
+
+## Phase 9: Vulnerability management
+
+Security updates install daily, scans run weekly, and compliance is re-walked monthly; every finding is fixed, mitigated or logged as an exception by its deadline.
+
+### 9.1 Patching
+
+`unattended-upgrades` is active by default on 26.04 and already pulls the security and ESM pockets. Add `/etc/apt/apt.conf.d/52unattended-local`:
+
+```
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Mail "root";
+```
+
+Livepatch covers kernel fixes between reboots; take a weekly reboot window for kernel, firmware and anything `needrestart` flags. Review open items with `pro security-status` and remediate a specific CVE with `pro fix CVE-YYYY-NNNNN`.
+
+### 9.2 OS vulnerability scan (weekly)
+
+Canonical publishes OVAL data per release ([Ubuntu OVAL](https://ubuntu.com/security/oval)). `/usr/local/sbin/oval-scan.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+d=/var/lib/oval; mkdir -p "$d"; cd "$d"
+rel=$(lsb_release -cs)
+curl -fsSLO "https://security-metadata.canonical.com/oval/com.ubuntu.${rel}.usn.oval.xml.bz2"
+bunzip2 -f "com.ubuntu.${rel}.usn.oval.xml.bz2"
+oscap oval eval --report "report-$(date +%F).html" "com.ubuntu.${rel}.usn.oval.xml" \
+  | grep -c ': true' > "open-$(date +%F).count" || true
+```
+
+Run it from a oneshot service plus a timer with `OnCalendar=Sun 04:00` and `Persistent=true`.
+
+### 9.3 Cluster and image scanning
+
+- Trivy Operator for image CVEs, config audits and exposed secrets in running workloads. Label `trivy-system` only if its scan jobs are rejected.
+
+```bash
+helm repo add aqua https://aquasecurity.github.io/helm-charts/ && helm repo update
+helm install trivy-operator aqua/trivy-operator -n trivy-system --create-namespace
+kubectl get vulnerabilityreports -A -o wide
+```
+
+- Rancher Compliance (the CIS scan app) from Rancher's Apps, running the RKE2 hardened profile weekly.
+- Admission policy with Kyverno or Kubewarden: an allow-list of registries, and image digests required in `llm`. Run it in audit mode for a week, then enforce.
+
+### 9.4 Logs and alerts
+
+Forward `/var/log/audit/audit.log`, `/var/log/auth.log`, the RKE2 API audit log and Rancher's audit log to your SIEM over the tailnet (Fluent Bit or rsyslog). Alert on a degraded pool, SMART failures, AIDE changes, faillock lockouts, Trivy criticals, and OVAL counts that rise week over week.
+
+### 9.5 Cadence and deadlines
+
+| Cadence | Task |
+| --- | --- |
+| Daily | Security updates, AIDE check, Livepatch, Trivy (continuous), sanoid snapshots |
+| Weekly | OVAL scan, CIS scan, reboot window, release check for RKE2, Rancher, OpenEBS, Garage, llama.cpp |
+| Monthly | Lynis audit, STIG checklist re-walk, ZFS scrub, offsite replication check |
+| Quarterly | Restore drill from an etcd snapshot, exception-register review, rotate the LLM API key and Garage keys, check for 26.04 STIG or USG content |
+
+Suggested remediation deadlines: critical (CVSS 9+) or STIG CAT I within 7 days; high within 14; medium or CAT II within 30; low or CAT III within 90. Anything that can't meet its deadline becomes a dated entry in the exception register.
+
+## STIG exception register
+
+Twelve deviations are planned; E-01 (FIPS) carries the most risk. Review the register quarterly, and add a row for any finding that misses its deadline.
+
+| ID | Deviation | Reason | Compensating controls | Closes when |
+| --- | --- | --- | --- | --- |
+| E-01 | No FIPS 140-validated crypto modules | Ubuntu Pro FIPS covers 22.04, with 24.04 in preview; nothing for 26.04 ([matrix](https://ubuntu.com/aws/pro?format=md)). A FIPS kernel would also lag Strix Halo's kernel needs | LUKS2 and ZFS AES-256 encryption at rest; SSH limited to AES-GCM/CTR and SHA-2; all remote traffic inside WireGuard (Tailscale) | Validated modules ship for 26.04 on a kernel that keeps AMD support |
+| E-02 | STIG applied by hand against the 24.04 STIG | No DISA 26.04 STIG; USG covers 22.04 and 24.04; ComplianceAsCode's 26.04 product is a draft with no STIG profile ([PR](https://github.com/ComplianceAsCode/content/pull/14721)) | STIG Viewer checklist per rule, Lynis monthly, OVAL weekly | DISA or Canonical publishes 26.04 content; switch to automated audit |
+| E-03 | IPv4 forwarding enabled | Required by the Kubernetes CNI | UFW default deny, NodePorts pinned to loopback, NetworkPolicies | Never (inherent to Kubernetes) |
+| E-04 | Host firewall does not filter pod traffic the CNI forwards | CNI rules run ahead of UFW | Default-deny NetworkPolicies in workload namespaces; services published only through the Tailscale operator | Never; reviewed with each new namespace |
+| E-05 | SSH key exchange lists `mlkem768x25519-sha256` first | Post-quantum hybrid, stronger than the STIG's list | Remaining algorithms per STIG; tailnet-only SSH, keys only | DISA updates its SSH algorithm list |
+| E-06 | LUKS unlocks through TPM2 without a PIN | Unattended reboots for patching | Secure Boot with PCR 7 binding, passphrase fallback, physical control of the box | Accepted risk; review yearly |
+| E-07 | AIDE excludes container, kubelet, model and ZFS paths | Constant legitimate churn | Image digests, Trivy, read-only model mounts with a SHA-256 manifest, ZFS snapshots | Never; reviewed with AIDE config |
+| E-08 | Pool has no redundancy | One HDD at start | `copies=2` on backups, offsite raw replication, SMART alerts | Second drive attached (Phase 4) |
+| E-09 | `disk_full_action = SYSLOG`, not halt | Availability of a single host | Dedicated 20 GB audit volume, email alert at 25% free | Accepted; the STIG allows it when availability overrides |
+| E-10 | etcd and pod S3 traffic to Garage is plain HTTP | Traffic never leaves the host | Garage unreachable from LAN and tailnet; scoped keys per bucket | TLS terminated in front of Garage |
+| E-11 | Namespaces labeled privileged: `openebs`, `tailscale`, plus any Rancher namespace you label | Their node plugins and proxies need host access | Vendor components only, images pinned by digest, Trivy scanned | Vendors ship restricted-compatible charts |
+| E-12 | sudo-rs instead of classic sudo | 26.04 default | Each sudo rule verified; fall back to classic sudo if a directive is missing | Verification complete (then drop this row) |
+
+## Final verification
+
+The build is done when every box below is ticked; the last test is an unattended reboot.
+
+- [ ] Secure Boot is on; LUKS shows `tpm2` and `password` slots; the recovery passphrase and ZFS key are stored offline.
+- [ ] `sudo auditctl -s` shows `enabled 2`; the STIG checklist has no open CAT I finding outside the register.
+- [ ] From a LAN device without Tailscale, `nmap -Pn -p- <lan-ip>` finds no open TCP port.
+- [ ] From a tailnet admin device, SSH, the Kubernetes API, Rancher and the LLM endpoint all answer; nothing else does.
+- [ ] A privileged test pod in `default` is rejected by Pod Security Admission.
+- [ ] `zpool status` is healthy, and `zfs get keystatus tank/enc` is `available` after reboot.
+- [ ] An etcd snapshot is in Garage, and an offsite raw replication has run.
+- [ ] One etcd restore was practised before real data landed.
+- [ ] The LLM endpoint returns 401 without the key, and a debug pod in `llm` cannot reach the internet.
+- [ ] The OVAL count and Trivy criticals are zero, or each open item is in the register with a date.
+- [ ] After `sudo reboot` with no one at the console, the pool, RKE2, Garage, Rancher and the LLM server all come back.
+
+## Sources
+
+- [AMD ROCm 10.1.0 compatibility matrix](https://rocm.docs.amd.com/en/docs-10.1.0/compatibility/compatibility-matrix.html)
+- [AMD RDNA3.5 system optimization (kernel and memory)](https://rocm.docs.amd.com/en/docs-7.14.0/_sources/reference/system-optimization/rdna3-5.rst)
+- [DISA Canonical Ubuntu 24.04 LTS STIG, V1R4 (NIST NCP)](https://ncp.nist.gov/checklist/revision/6362)
+- [Ubuntu Pro feature coverage by release](https://ubuntu.com/aws/pro?format=md)
+- [Ubuntu 26.04 server changes](https://computingforgeeks.com/?p=166549) and [sudo-rs notes](https://computingforgeeks.com/?p=165185)
+- [Ubuntu 26.04 release summary](https://versionlog.com/ubuntu/26.04/)
+- [zfsutils-linux 2.4.1 in Ubuntu 26.04](https://packages.ubuntu.com/eu/resolute/arm64/zfsutils-linux)
+- [OpenZFS RAIDZ expansion](https://github.com/openzfs/zfs/pull/12225) and [zfs rewrite](https://en.linuxadictos.com/OpenZFS-2--3--and-4-arrive-with-expanded-compatibility-and-ZFS-Rewrite-in-detail..html)
+- [RKE2 CIS hardening guide](https://docs.rke2.io/security/hardening_guide) and [RKE2 requirements](https://docs.rke2.io/install/requirements)
+- [RGS RKE2 STIG: secrets encryption](https://www.stigviewer.com/stigs/rancher_government_solutions_rke2_v2/2024-12-20/finding/V-254573)
+- [Rancher 2.14.6 release notes](https://documentation.suse.com/cloudnative/rancher-manager/v2.14/en/release-notes/v2.14.6.html) and [Rancher 2.15 Helm chart options](https://documentation.suse.com/cloudnative/rancher-manager/v2.15/en/installation-and-upgrade/references/helm-chart-options.html)
+- [Tailscale Kubernetes operator](https://Tailscale.com/kb/1236/kubernetes-operator)
+- [OpenEBS ZFS-LocalPV](https://www.github.com/openebs/zfs-localpv)
+- [Garage quick start](https://garagehq.deuxfleurs.fr/documentation/quick-start) and [MinIO repository status](https://blog.vonng.com/en/db/minio-resurrect/index.md)
+- [AMD GPU device plugin for Kubernetes](https://instinct.docs.amd.com/projects/k8s-device-plugin/en/latest/index.html)
+- [llama.cpp container images](https://huggingface.co/tda45/TdAI/raw/main/llama.cpp/docs/docker.md)
+- [Strix Halo toolboxes (firmware caveat)](https://github.com/kyuz0/amd-strix-halo-toolboxes)
+- [Ubuntu OVAL data](https://ubuntu.com/security/oval)
+- [ComplianceAsCode Ubuntu 26.04 draft](https://github.com/ComplianceAsCode/content/pull/14721)
